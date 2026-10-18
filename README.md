@@ -22,12 +22,12 @@ Default (adaptive) scheduling behavior:
 
 Other schedulers should run. Other samplers may not run well.
 
-Default settings are on the safer side. If you want more speed, increase max_consecutive_forecasts, and/or reduce warmup_steps/tail_actual_step
+Default settings are on the safer side. If you want more speed, increase max_consecutive_forecasts, and/or reduce warmup_steps/tail_actual_steps
 
 ## Credits
 Spectrum method / paper:
 
-- **Spectrum: Spectral Feature Forecasting for Diffusion Sampling Acceleration** — arXiv:2603.01623
+- **Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration** — arXiv:2603.01623
 - Official implementation: https://github.com/hanjq17/Spectrum
 
 ## License
