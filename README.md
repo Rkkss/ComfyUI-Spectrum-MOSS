@@ -19,8 +19,9 @@ Default (adaptive) scheduling behavior:
  I only tested with:
 - 50 sampling steps 
 - Euler + sgm_uniform
+- Other schedulers should run. Other samplers may not run well.
 
-Other schedulers should run. Other samplers may not run well.
+Speed gain is about x2 - x2.5 with the default setup
 
 Default settings are on the safer side. If you want more speed, increase max_consecutive_forecasts, and/or reduce warmup_steps/tail_actual_steps
 
