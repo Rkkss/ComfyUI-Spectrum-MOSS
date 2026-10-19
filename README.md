@@ -15,7 +15,7 @@ Default (adaptive) scheduling behavior:
 3. After the guard, the scheduler can expand the forecast horizon up to the configured cap.
 4. The final (tail) 2 steps are actual evaluations.
 
-## Recommended setup
+## Recommended 
  I only tested with:
 - 50 sampling steps 
 - Euler + sgm_uniform
@@ -24,6 +24,13 @@ Default (adaptive) scheduling behavior:
 Speed gain is about x2 - x2.5 with the default setup
 
 Default settings are on the safer side. If you want more speed, increase max_consecutive_forecasts, and/or reduce warmup_steps/tail_actual_steps
+
+## Examples 
+<p align="center">
+  <img src="examples/1.png" width="48%">
+  <img src="examples/2.png" width="48%">
+   <img src="examples/3.png" width="48%">
+</p>
 
 ## Credits
 Spectrum method / paper:
