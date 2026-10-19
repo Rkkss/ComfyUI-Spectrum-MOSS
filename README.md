@@ -11,8 +11,8 @@ This build contains two nodes:
 Default (adaptive) scheduling behavior:
 
 1. First (warmup) steps are actual transformer evaluations.
-2. The next 8-step (detail guard) allow at most one forecast between actual refreshes.
-3. After the guard, the scheduler can expand the forecast horizon up to the configured cap.
+2. The next few steps (detail_guard) allow at most one forecast between actual refreshes.
+3. After the guard, the scheduler can expand the forecast horizon up to the configured cap (post_guard_cap).
 4. The final (tail) 2 steps are actual evaluations.
 
 ## Recommended 
