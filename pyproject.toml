@@ -12,6 +12,6 @@ Documentation = "https://github.com/Rkkss/ComfyUI-Spectrum-MOSS#readme"
 Issues = "https://github.com/Rkkss/ComfyUI-Spectrum-MOSS/issues"
 
 [tool.comfy]
-PublisherId = "Rkkss"
+PublisherId = "rkkss"
 DisplayName = "ComfyUI-Spectrum-MOSS"
 Icon = ""
