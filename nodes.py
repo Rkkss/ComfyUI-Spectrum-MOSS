@@ -6,6 +6,13 @@
 #
 # SPDX-License-Identifier: GPL-3.0-only
 
+"""
+@author: Rkkss
+@title: ComfyUI-Spectrum-MOSS
+@nickname: Spectrum MOSS
+@description: Spectrum-style hidden-state forecasting acceleration for native ComfyUI MOSS-Image.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -73,6 +80,7 @@ class SpectrumConfig:
     # Adaptive scheduling controls. Other adaptive constants are fixed above.
     detail_guard_steps: int = 8
     post_guard_horizon_cap: int = 6
+    error_tolerance: float = 1.0
 
     debug: bool = False
 
@@ -114,6 +122,8 @@ class SpectrumConfig:
                 raise ValueError("detail_guard_steps must be >= 0")
             if self.post_guard_horizon_cap < 1:
                 raise ValueError("post_guard_horizon_cap must be >= 1")
+            if self.error_tolerance <= 0.0:
+                raise ValueError("error_tolerance must be > 0")
 
     @property
     def window_growth_cap(self) -> float:
@@ -657,11 +667,13 @@ def _adaptive_validate_and_update(
         r95 = p95 / max(branch.baseline_p95, 1e-8)
         r99 = p99 / max(branch.baseline_p99, 1e-8)
         ratio = max(r95, r99)
+        medium_threshold = _ADAPTIVE_MEDIUM_RATIO * config.error_tolerance
+        high_threshold = _ADAPTIVE_HIGH_RATIO * config.error_tolerance
         if branch.baseline_observations < 3:
             tier = "learning"
-        elif ratio >= _ADAPTIVE_HIGH_RATIO:
+        elif ratio >= high_threshold:
             tier = "high"
-        elif ratio >= _ADAPTIVE_MEDIUM_RATIO:
+        elif ratio >= medium_threshold:
             tier = "medium"
         else:
             tier = "normal"
@@ -717,7 +729,7 @@ def _adaptive_validate_and_update(
         f"local tier={tier} p95={p95:.5f} p99={p99:.5f} "
         f"base95={branch.baseline_p95 if branch.baseline_p95 is not None else float('nan'):.5f} "
         f"base99={branch.baseline_p99 if branch.baseline_p99 is not None else float('nan'):.5f} "
-        f"ratio={ratio:.3f} streak={preceding_forecast_streak} "
+        f"ratio={ratio:.3f} tol={config.error_tolerance:.2f} streak={preceding_forecast_streak} "
         f"horizon={branch.adaptive_horizon} repair={branch.repair_actual_steps_remaining} "
         f"cooldown={branch.cooldown_refreshes_remaining} "
         f"coolcap={branch.cooldown_horizon_cap if branch.cooldown_horizon_cap is not None else 'none'}",
@@ -990,6 +1002,18 @@ def apply_spectrum_moss(model: Any, config: SpectrumConfig) -> Any:
             "MOSS diffusion model with Load Diffusion Model."
         )
 
+    # Re-applying Spectrum to an already Spectrum-patched MODEL must replace
+    # the previous Spectrum wrapper rather than stack another nested wrapper.
+    # ModelPatcher.clone() carries model_options forward, while ComfyUI's
+    # add_wrapper_with_key() appends under an existing key.
+    transformer_options = clone.model_options.get("transformer_options")
+    if isinstance(transformer_options, dict):
+        wrappers = transformer_options.get("wrappers")
+        if isinstance(wrappers, dict):
+            by_type = wrappers.get(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL)
+            if isinstance(by_type, dict):
+                by_type.pop(WRAPPER_KEY, None)
+
     wrapper = _make_spectrum_wrapper(config)
     comfy.patcher_extension.add_wrapper_with_key(
         comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
@@ -1005,6 +1029,10 @@ def apply_spectrum_moss(model: Any, config: SpectrumConfig) -> Any:
 class SpectrumMOSSImageManual:
     """Manual Spectrum controls for native ComfyUI MOSS-Image."""
 
+    DESCRIPTION = (
+        "Manual Spectrum scheduling for MOSS-Image. Forecasts hidden states to skip full "
+        "transformer evaluations. Higher forecast settings improve speed but may reduce image quality."
+    )
     CATEGORY = "model/optimization"
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
@@ -1015,18 +1043,54 @@ class SpectrumMOSSImageManual:
         return {
             "required": {
                 "model": ("MODEL",),
-                "warmup_steps": ("INT", {"default": 8, "min": 0, "max": 64, "step": 1}),
-                "tail_actual_steps": ("INT", {"default": 2, "min": 0, "max": 64, "step": 1}),
-                "window_size": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 16.0, "step": 0.25}),
-                "flex_window": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 8.0, "step": 0.05}),
-                "max_consecutive_forecasts": ("INT", {"default": 2, "min": 0, "max": 32, "step": 1}),
-                "history_points": ("INT", {"default": 8, "min": 2, "max": 32, "step": 1}),
-                "chebyshev_degree": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
-                "ridge_lambda": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 10.0, "step": 0.01}),
-                "blend_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "cache_device": (["main_device", "offload_device", "cpu"], {"default": "main_device"}),
-                "force_actual_on_control": ("BOOLEAN", {"default": True}),
-                "debug": ("BOOLEAN", {"default": False}),
+                "warmup_steps": ("INT", {
+                    "default": 8, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "Initial steps that always run the full transformer. Higher = safer quality, lower = more speed. Default 8.",
+                }),
+                "tail_actual_steps": ("INT", {
+                    "default": 2, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "Final steps that always run the full transformer. Helps preserve late-stage details. Higher = safer, lower = faster. Default 2.",
+                }),
+                "window_size": ("FLOAT", {
+                    "default": 2.0, "min": 1.0, "max": 16.0, "step": 0.25,
+                    "tooltip": "Starting forecast window. Controls how quickly full transformer refreshes occur. Higher = potentially more speed, but greater forecast error risk.",
+                }),
+                "flex_window": ("FLOAT", {
+                    "default": 0.75, "min": 0.0, "max": 8.0, "step": 0.05,
+                    "tooltip": "Amount the forecast window can grow after successful refreshes. Higher = ramps toward longer forecast streaks faster. Lower = more conservative.",
+                }),
+                "max_consecutive_forecasts": ("INT", {
+                    "default": 2, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "Maximum forecasts allowed in a row before forcing a full transformer refresh. Main speed/quality control: higher = faster but riskier. Default 2 is conservative.",
+                }),
+                "history_points": ("INT", {
+                    "default": 8, "min": 2, "max": 32, "step": 1,
+                    "tooltip": "Number of previous actual hidden states used for forecasting. More history uses more memory. Usually leave at default 8.",
+                }),
+                "chebyshev_degree": ("INT", {
+                    "default": 4, "min": 1, "max": 12, "step": 1,
+                    "tooltip": "Polynomial degree used by the spectral predictor. Higher is not necessarily better and may become unstable. Usually leave at default 4.",
+                }),
+                "ridge_lambda": ("FLOAT", {
+                    "default": 0.1, "min": 0.0, "max": 10.0, "step": 0.01,
+                    "tooltip": "Regularization strength for the spectral predictor. Helps prevent unstable extrapolation. Usually leave at default 0.1.",
+                }),
+                "blend_weight": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Mix between spectral prediction and linear extrapolation. 0 = linear only, 1 = spectral only. Default 0.5 is recommended.",
+                }),
+                "cache_device": (["main_device", "offload_device", "cpu"], {
+                    "default": "main_device",
+                    "tooltip": "Where actual hidden-state history is stored. main_device is fastest but uses VRAM. CPU/offload saves VRAM but may reduce speed.",
+                }),
+                "force_actual_on_control": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Force full transformer evaluations when a control input is present. Safer for compatibility and quality. Recommended: enabled.",
+                }),
+                "debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print Spectrum scheduling, forecast error and speed statistics to the console.",
+                }),
             }
         }
 
@@ -1052,12 +1116,12 @@ class SpectrumMOSSImageManual:
 
 
 class SpectrumMOSSImageAdaptive:
-    """Validated adaptive policy for native ComfyUI MOSS-Image.
+    """Validated adaptive policy for native ComfyUI MOSS-Image."""
 
-    Predictor and local-drift constants are pinned to the tested v0.6 values.
-    The UI exposes only controls that materially change production scheduling.
-    """
-
+    DESCRIPTION = (
+        "Experimental error-aware Spectrum scheduler for MOSS-Image. It measures forecast error "
+        "at actual refreshes and automatically adjusts the forecast horizon. Speed varies with prompt and trajectory."
+    )
     CATEGORY = "model/optimization"
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
@@ -1068,19 +1132,50 @@ class SpectrumMOSSImageAdaptive:
         return {
             "required": {
                 "model": ("MODEL",),
-                "warmup_steps": ("INT", {"default": 8, "min": 0, "max": 64, "step": 1}),
-                "detail_guard_steps": ("INT", {"default": 8, "min": 0, "max": 32, "step": 1}),
-                "tail_actual_steps": ("INT", {"default": 2, "min": 0, "max": 16, "step": 1}),
-                "post_guard_horizon_cap": ("INT", {"default": 6, "min": 1, "max": 16, "step": 1}),
-                "window_size": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 16.0, "step": 0.25}),
-                "flex_window": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 8.0, "step": 0.05}),
-                "cache_device": (["main_device", "offload_device", "cpu"], {"default": "main_device"}),
-                "debug": ("BOOLEAN", {"default": False}),
+                "warmup_steps": ("INT", {
+                    "default": 8, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "Initial steps that always run the full transformer. Higher = safer quality, lower = more potential speed. Default 8.",
+                }),
+                "detail_guard_steps": ("INT", {
+                    "default": 8, "min": 0, "max": 32, "step": 1,
+                    "tooltip": "Protected steps immediately after warmup. At most one forecast is allowed between actual refreshes. Higher = safer early details but slower. Default 8.",
+                }),
+                "tail_actual_steps": ("INT", {
+                    "default": 2, "min": 0, "max": 16, "step": 1,
+                    "tooltip": "Final steps that always run the full transformer. Helps preserve late-stage details. Higher = safer, lower = faster. Default 2.",
+                }),
+                "post_guard_horizon_cap": ("INT", {
+                    "default": 6, "min": 1, "max": 16, "step": 1,
+                    "tooltip": "Maximum forecast streak allowed after the detail guard. The adaptive error controller may automatically use a lower value. Higher = more potential speed but greater quality risk.",
+                }),
+                "window_size": ("FLOAT", {
+                    "default": 2.0, "min": 1.0, "max": 16.0, "step": 0.25,
+                    "tooltip": "Starting forecast budget before the next full transformer refresh. The adaptive safety controller can reduce it when forecast error increases.",
+                }),
+                "flex_window": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 8.0, "step": 0.05,
+                    "tooltip": "How quickly the forecast budget can grow after successful refreshes. Higher = more aggressive speed ramp. Lower = more conservative.",
+                }),
+                "cache_device": (["main_device", "offload_device", "cpu"], {
+                    "default": "main_device",
+                    "tooltip": "Where actual hidden-state history is stored. main_device is fastest but uses VRAM. CPU/offload saves VRAM but may reduce speed.",
+                }),
+                "debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print adaptive decisions, p95/p99 forecast error, horizon changes and final actual/forecast counts to the console.",
+                }),
+                # Keep new widgets appended after all v0.6 widgets. ComfyUI stores
+                # workflow widget values positionally, so inserting this in the
+                # middle would shift values when an old v0.6 workflow is loaded.
+                "error_tolerance": ("FLOAT", {
+                    "default": 1.0, "min": 0.75, "max": 1.5, "step": 0.05,
+                    "tooltip": "Controls how much forecast error the adaptive scheduler tolerates before reducing the forecast horizon. Higher = faster but riskier. Lower = safer but slower. 1.0 uses the default.",
+                }),
             }
         }
 
     def patch(self, model, warmup_steps, detail_guard_steps, tail_actual_steps,
-              post_guard_horizon_cap, window_size, flex_window, cache_device, debug):
+              post_guard_horizon_cap, window_size, flex_window, cache_device, debug, error_tolerance):
         cap = max(1, int(post_guard_horizon_cap))
         config = SpectrumConfig(
             mode="adaptive",
@@ -1096,6 +1191,7 @@ class SpectrumMOSSImageAdaptive:
             force_actual_on_control=True,
             detail_guard_steps=detail_guard_steps,
             post_guard_horizon_cap=cap,
+            error_tolerance=error_tolerance,
             debug=debug,
         )
         return (apply_spectrum_moss(model, config),)

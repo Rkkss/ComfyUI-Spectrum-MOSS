@@ -1,4 +1,11 @@
 # Changelog
+## 0.7.0
+- Added hover tooltips and node descriptions for Manual and Adaptive controls.
+- Added `error_tolerance` to Adaptive: values above 1.0 tolerate more forecast error for more speed; values below 1.0 are more conservative. `1.0` preserves the previous default thresholds.
+- Added Comfy Registry / ComfyUI-Manager metadata (`pyproject.toml`, `node_list.json`, legacy header metadata).
+- Preserved the v0.6 Adaptive widget order and appended `error_tolerance` at the end so existing v0.6 workflows do not have positional widget values shifted on load.
+- Re-applying a Spectrum node now replaces an existing Spectrum diffusion wrapper on the cloned model instead of stacking a second Spectrum wrapper.
+
 
 ## 0.6.0-public
 
