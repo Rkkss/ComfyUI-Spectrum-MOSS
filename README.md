@@ -23,7 +23,9 @@ Default (adaptive) scheduling behavior:
 
 Speed gain is about x2 - x2.5 with the default setup
 
-Default settings are on the safer side. If you want more speed, increase max_consecutive_forecasts, and/or reduce warmup_steps/tail_actual_steps
+Default settings are on the safer side. If you want more speed, increase max_consecutive_forecasts, and/or reduce warmup_steps/tail_actual_steps. 
+
+Detail_guard allows at most 1 forecast during this window. A higher error_tolerance value allows more "room for error" after guard steps.  Both values may also affect speed.
 
 ## Examples 
 <p align="center">
