@@ -17,7 +17,7 @@ Default (adaptive) scheduling behavior:
 
 ## Recommended settings
  I only tested with:
-- 50 sampling steps 
+- 50 sampling steps  (If you want to use a different number of total steps, adjust spectrum's steps accordingly) 
 - Euler + sgm_uniform
 - Other schedulers should run. Other samplers may not run well.
 
