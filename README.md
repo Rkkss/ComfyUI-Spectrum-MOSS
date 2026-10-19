@@ -15,7 +15,7 @@ Default (adaptive) scheduling behavior:
 3. After the guard, the scheduler can expand the forecast horizon up to the configured cap (post_guard_cap).
 4. The final (tail) 2 steps are actual evaluations.
 
-## Recommended 
+## Recommended settings
  I only tested with:
 - 50 sampling steps 
 - Euler + sgm_uniform
