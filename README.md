@@ -32,6 +32,8 @@ Detail_guard allows at most 1 forecast during this window. A higher error_tolera
   <img src="examples/1.png" width="48%">
   <img src="examples/2.png" width="48%">
    <img src="examples/3.png" width="48%">
+    <img src="examples/4.png" width="48%">
+
 </p>
 
 ## Credits
