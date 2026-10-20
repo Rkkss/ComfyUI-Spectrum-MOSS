@@ -17,10 +17,13 @@ Default (adaptive) scheduling behavior:
 
 ## Recommended settings
  
- OpenMOSS Official's suggestion 50 steps/euler+sgm_uniform 
+ OpenMOSS Official's suggestion 50 steps/euler+sgm_uniform:
+ 
  <img src="examples/euler.jpg" width="48%">
 
- Comfy-Org's template 25 steps/er_sde+simple 
+ 
+ Comfy-Org's template 25 steps/er_sde+simple: 
+ 
  <img src="examples/er_sde.jpg" width="48%">
 
 
