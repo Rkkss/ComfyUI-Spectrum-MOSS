@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-spectrum-moss"
 description = "Spectrum-style hidden-state forecasting acceleration for native ComfyUI MOSS-Image."
-version = "0.7.0"
+version = "0.8.0"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = []
@@ -12,6 +12,6 @@ Documentation = "https://github.com/Rkkss/ComfyUI-Spectrum-MOSS#readme"
 Issues = "https://github.com/Rkkss/ComfyUI-Spectrum-MOSS/issues"
 
 [tool.comfy]
-PublisherId = "rkkss"
+PublisherId = "Rkkss"
 DisplayName = "ComfyUI-Spectrum-MOSS"
 Icon = ""

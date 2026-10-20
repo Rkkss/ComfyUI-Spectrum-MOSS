@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Any, Optional
 
@@ -25,6 +25,14 @@ import comfy.model_management as model_management
 import comfy.patcher_extension
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.moss_image.model import modulated_rms_norm
+
+from .er_sde_bridge import (
+    ER_SDE_BRIDGE_PREDICT_WRAPPER_KEY,
+    ER_SDE_BRIDGE_SAMPLER_WRAPPER_KEY,
+    ERSDESolverBridge,
+    er_sde_active,
+    install_bridge_wrappers,
+)
 
 
 LOG_TAG = "Spectrum-MOSS"
@@ -83,6 +91,7 @@ class SpectrumConfig:
     error_tolerance: float = 1.0
 
     debug: bool = False
+    warn_unverified_sampler: bool = True
 
     @property
     def adaptive(self) -> bool:
@@ -105,11 +114,6 @@ class SpectrumConfig:
             raise ValueError("history_points must be >= 2")
         if self.chebyshev_degree < 1:
             raise ValueError("chebyshev_degree must be >= 1")
-        if self.history_points < self.chebyshev_degree + 1:
-            raise ValueError(
-                "history_points must be at least chebyshev_degree + 1 "
-                f"(got history_points={self.history_points}, degree={self.chebyshev_degree})"
-            )
         if self.ridge_lambda < 0.0:
             raise ValueError("ridge_lambda must be >= 0")
         if not 0.0 <= self.blend_weight <= 1.0:
@@ -458,7 +462,7 @@ class SpectrumRootState:
 
     def branch(self, key: Any) -> SpectrumBranchState:
         if key not in self.branches:
-            self.branches[key] = SpectrumBranchState(self.config)
+            self.branches[key] = SpectrumBranchState(_runtime_config(self.config))
         return self.branches[key]
 
 
@@ -532,6 +536,36 @@ def _patch_signature(transformer_options: dict) -> tuple[str, ...]:
         return tuple(sorted(repr(key) for key in dit.keys()))
     except Exception:
         return ()
+
+
+def _runtime_config(config: SpectrumConfig) -> SpectrumConfig:
+    """Apply only sampler-specific runtime policy overrides.
+
+    ER-SDE uses the predictor settings validated by the bridge tests. Manual
+    scheduling controls remain user-controlled. Adaptive keeps its error/guard
+    logic, but ER-SDE caps the forecast horizon at one and therefore ignores
+    its window-growth controls.
+    """
+    if not er_sde_active():
+        return config
+    if config.adaptive:
+        return replace(
+            config,
+            window_size=1.0,
+            flex_window=0.0,
+            post_guard_horizon_cap=1,
+            history_points=_ADAPTIVE_HISTORY_POINTS,
+            chebyshev_degree=_ADAPTIVE_CHEBYSHEV_DEGREE,
+            ridge_lambda=_ADAPTIVE_RIDGE_LAMBDA,
+            blend_weight=_ADAPTIVE_BLEND_WEIGHT,
+        )
+    return replace(
+        config,
+        history_points=_ADAPTIVE_HISTORY_POINTS,
+        chebyshev_degree=_ADAPTIVE_CHEBYSHEV_DEGREE,
+        ridge_lambda=_ADAPTIVE_RIDGE_LAMBDA,
+        blend_weight=_ADAPTIVE_BLEND_WEIGHT,
+    )
 
 
 def _adaptive_phase_horizon_cap(config: SpectrumConfig, step_index: int) -> int:
@@ -849,7 +883,7 @@ def _run_forecast(
     return out
 
 
-def _make_spectrum_wrapper(config: SpectrumConfig):
+def _make_spectrum_wrapper(config: SpectrumConfig, decision_observer=None):
     root = SpectrumRootState(config)
 
     def spectrum_moss_wrapper(
@@ -890,6 +924,7 @@ def _make_spectrum_wrapper(config: SpectrumConfig):
         patch_key = _patch_signature(transformer_options)
         branch_key = (cond_key, patch_key)
         branch = root.branch(branch_key)
+        runtime_config = branch.config
 
         image_tokens = int(x.shape[-2]) * int(x.shape[-1])
         known_shape = branch.forecaster.feature_shape
@@ -909,7 +944,7 @@ def _make_spectrum_wrapper(config: SpectrumConfig):
             step_index,
             total_steps,
             control_present,
-            config,
+            runtime_config,
         )
         coord = _normalize_step_position(step_index, total_steps)
 
@@ -918,7 +953,7 @@ def _make_spectrum_wrapper(config: SpectrumConfig):
                 out = _run_actual(
                     executor,
                     core,
-                    config,
+                    runtime_config,
                     branch,
                     reason,
                     step_index,
@@ -933,7 +968,7 @@ def _make_spectrum_wrapper(config: SpectrumConfig):
                 try:
                     out = _run_forecast(
                         core,
-                        config,
+                        runtime_config,
                         branch,
                         step_index,
                         total_steps,
@@ -946,11 +981,11 @@ def _make_spectrum_wrapper(config: SpectrumConfig):
                     # A numerical/shape/API problem should never ruin a generation.
                     actual = True
                     reason = "forecast_failed"
-                    _log_debug(config.debug, f"forecast failed ({type(exc).__name__}: {exc}); using real step")
+                    _log_debug(runtime_config.debug, f"forecast failed ({type(exc).__name__}: {exc}); using real step")
                     out = _run_actual(
                         executor,
                         core,
-                        config,
+                        runtime_config,
                         branch,
                         reason,
                         step_index,
@@ -962,7 +997,12 @@ def _make_spectrum_wrapper(config: SpectrumConfig):
                         image_tokens,
                     )
         finally:
-            _note_decision(branch, actual, reason, config)
+            _note_decision(branch, actual, reason, runtime_config)
+            if decision_observer is not None:
+                try:
+                    decision_observer(step_index, total_steps, actual, reason, branch_key)
+                except Exception as exc:
+                    _log_debug(runtime_config.debug, f"decision observer failed ({type(exc).__name__}: {exc})")
             root.last_step_index = step_index
             root.last_sigmas_id = id(sigmas)
             root.last_total_steps = total_steps
@@ -971,7 +1011,7 @@ def _make_spectrum_wrapper(config: SpectrumConfig):
         if step_index >= 0 and step_index >= total_steps - 1:
             root.completed_branches.add(branch_key)
             if len(root.completed_branches) >= len(root.branches):
-                if config.debug and not root.summary_logged:
+                if runtime_config.debug and not root.summary_logged:
                     actual_calls = sum(b.actual_count for b in root.branches.values())
                     forecast_calls = sum(b.forecast_count for b in root.branches.values())
                     total_calls = actual_calls + forecast_calls
@@ -991,6 +1031,45 @@ def _make_spectrum_wrapper(config: SpectrumConfig):
     return spectrum_moss_wrapper
 
 
+def _remove_wrapper_key(model_options: dict, wrapper_type: str, key: str) -> None:
+    transformer_options = model_options.get("transformer_options")
+    if not isinstance(transformer_options, dict):
+        return
+    wrappers = transformer_options.get("wrappers")
+    if not isinstance(wrappers, dict):
+        return
+    by_type = wrappers.get(wrapper_type)
+    if isinstance(by_type, dict):
+        by_type.pop(key, None)
+
+
+def _make_production_diffusion_wrapper(config: SpectrumConfig, bridge: ERSDESolverBridge):
+    spectrum_wrapper = _make_spectrum_wrapper(
+        config, decision_observer=bridge.note_branch_decision
+    )
+
+    def production_wrapper(
+        executor: Any,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: Any = None,
+        transformer_options: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        # Structural ER-SDE bridge conflicts fail closed to an actual transformer
+        # call. Unsupported sampler names do not trigger this path; they only warn.
+        if bridge.bypass_spectrum:
+            if not isinstance(transformer_options, dict):
+                transformer_options = {}
+            return executor(x, timestep, context, transformer_options, **kwargs)
+        return spectrum_wrapper(
+            executor, x, timestep, context, transformer_options, **kwargs
+        )
+
+    production_wrapper.root_state = spectrum_wrapper.root_state  # type: ignore[attr-defined]
+    return production_wrapper
+
+
 def apply_spectrum_moss(model: Any, config: SpectrumConfig) -> Any:
     config.validate()
     clone = model.clone()
@@ -1002,19 +1081,20 @@ def apply_spectrum_moss(model: Any, config: SpectrumConfig) -> Any:
             "MOSS diffusion model with Load Diffusion Model."
         )
 
-    # Re-applying Spectrum to an already Spectrum-patched MODEL must replace
-    # the previous Spectrum wrapper rather than stack another nested wrapper.
-    # ModelPatcher.clone() carries model_options forward, while ComfyUI's
-    # add_wrapper_with_key() appends under an existing key.
-    transformer_options = clone.model_options.get("transformer_options")
-    if isinstance(transformer_options, dict):
-        wrappers = transformer_options.get("wrappers")
-        if isinstance(wrappers, dict):
-            by_type = wrappers.get(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL)
-            if isinstance(by_type, dict):
-                by_type.pop(WRAPPER_KEY, None)
+    # Re-applying Spectrum replaces only Spectrum-MOSS wrappers. Other model
+    # wrappers (SLG, compile, LoRA-related options, etc.) are left untouched.
+    for wrapper_type, key in (
+        (comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY),
+        (comfy.patcher_extension.WrappersMP.PREDICT_NOISE, ER_SDE_BRIDGE_PREDICT_WRAPPER_KEY),
+        (comfy.patcher_extension.WrappersMP.SAMPLER_SAMPLE, ER_SDE_BRIDGE_SAMPLER_WRAPPER_KEY),
+    ):
+        _remove_wrapper_key(clone.model_options, wrapper_type, key)
 
-    wrapper = _make_spectrum_wrapper(config)
+    bridge = ERSDESolverBridge(
+        debug=config.debug,
+        warn_unverified_sampler=config.warn_unverified_sampler,
+    )
+    wrapper = _make_production_diffusion_wrapper(config, bridge)
     comfy.patcher_extension.add_wrapper_with_key(
         comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
         WRAPPER_KEY,
@@ -1022,8 +1102,8 @@ def apply_spectrum_moss(model: Any, config: SpectrumConfig) -> Any:
         clone.model_options,
         is_model_options=True,
     )
+    install_bridge_wrappers(clone.model_options, bridge)
     return clone
-
 
 
 class SpectrumMOSSImageManual:
@@ -1031,7 +1111,7 @@ class SpectrumMOSSImageManual:
 
     DESCRIPTION = (
         "Manual Spectrum scheduling for MOSS-Image. Forecasts hidden states to skip full "
-        "transformer evaluations. Higher forecast settings improve speed but may reduce image quality."
+        "transformer evaluations. Native ER-SDE is detected automatically and uses the solver bridge."
     )
     CATEGORY = "model/optimization"
     RETURN_TYPES = ("MODEL",)
@@ -1045,39 +1125,39 @@ class SpectrumMOSSImageManual:
                 "model": ("MODEL",),
                 "warmup_steps": ("INT", {
                     "default": 8, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "Initial steps that always run the full transformer. Higher = safer quality, lower = more speed. Default 8.",
+                    "tooltip": "Initial steps that always run the full transformer before forecasting is allowed. Higher = safer, lower = faster.",
                 }),
                 "tail_actual_steps": ("INT", {
                     "default": 2, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "Final steps that always run the full transformer. Helps preserve late-stage details. Higher = safer, lower = faster. Default 2.",
+                    "tooltip": "Final steps forced to use the full transformer. Higher = safer, lower = faster.",
                 }),
                 "window_size": ("FLOAT", {
                     "default": 2.0, "min": 1.0, "max": 16.0, "step": 0.25,
-                    "tooltip": "Starting forecast window. Controls how quickly full transformer refreshes occur. Higher = potentially more speed, but greater forecast error risk.",
+                    "tooltip": "Starting forecast window before a full-transformer refresh. Higher = more aggressive, lower = safer.",
                 }),
                 "flex_window": ("FLOAT", {
                     "default": 0.75, "min": 0.0, "max": 8.0, "step": 0.05,
-                    "tooltip": "Amount the forecast window can grow after successful refreshes. Higher = ramps toward longer forecast streaks faster. Lower = more conservative.",
+                    "tooltip": "How much the forecast window can grow after refreshes. Higher = more aggressive, lower = safer.",
                 }),
                 "max_consecutive_forecasts": ("INT", {
                     "default": 2, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "Maximum forecasts allowed in a row before forcing a full transformer refresh. Main speed/quality control: higher = faster but riskier. Default 2 is conservative.",
+                    "tooltip": "Maximum forecast steps allowed in a row before an actual refresh. Higher = faster/riskier, lower = safer.",
                 }),
                 "history_points": ("INT", {
                     "default": 8, "min": 2, "max": 32, "step": 1,
-                    "tooltip": "Number of previous actual hidden states used for forecasting. More history uses more memory. Usually leave at default 8.",
+                    "tooltip": "Number of actual hidden-state anchors kept for the Spectrum predictor. More history uses more memory. ER-SDE: ignored.",
                 }),
                 "chebyshev_degree": ("INT", {
                     "default": 4, "min": 1, "max": 12, "step": 1,
-                    "tooltip": "Polynomial degree used by the spectral predictor. Higher is not necessarily better and may become unstable. Usually leave at default 4.",
+                    "tooltip": "Polynomial degree used by the Spectrum predictor. Higher can model more complex trends but may be less stable. ER-SDE: ignored.",
                 }),
                 "ridge_lambda": ("FLOAT", {
                     "default": 0.1, "min": 0.0, "max": 10.0, "step": 0.01,
-                    "tooltip": "Regularization strength for the spectral predictor. Helps prevent unstable extrapolation. Usually leave at default 0.1.",
+                    "tooltip": "Regularization strength for the Spectrum predictor. Higher damps extrapolation more strongly. ER-SDE: ignored.",
                 }),
                 "blend_weight": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Mix between spectral prediction and linear extrapolation. 0 = linear only, 1 = spectral only. Default 0.5 is recommended.",
+                    "tooltip": "Mix between spectral prediction and linear extrapolation. 0 = linear only, 1 = spectral only. ER-SDE: ignored.",
                 }),
                 "cache_device": (["main_device", "offload_device", "cpu"], {
                     "default": "main_device",
@@ -1085,18 +1165,22 @@ class SpectrumMOSSImageManual:
                 }),
                 "force_actual_on_control": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Force full transformer evaluations when a control input is present. Safer for compatibility and quality. Recommended: enabled.",
+                    "tooltip": "Force actual transformer evaluation when a control input is present. Enabled = safer compatibility.",
                 }),
                 "debug": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Print Spectrum scheduling, forecast error and speed statistics to the console.",
+                }),
+                "warn_unverified_sampler": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Show a console warning for samplers not yet validated. Does not change sampler behavior.",
                 }),
             }
         }
 
     def patch(self, model, warmup_steps, tail_actual_steps, window_size, flex_window,
               max_consecutive_forecasts, history_points, chebyshev_degree, ridge_lambda,
-              blend_weight, cache_device, force_actual_on_control, debug):
+              blend_weight, cache_device, force_actual_on_control, debug, warn_unverified_sampler):
         config = SpectrumConfig(
             mode="manual",
             warmup_steps=warmup_steps,
@@ -1111,6 +1195,7 @@ class SpectrumMOSSImageManual:
             cache_device=cache_device,
             force_actual_on_control=force_actual_on_control,
             debug=debug,
+            warn_unverified_sampler=warn_unverified_sampler,
         )
         return (apply_spectrum_moss(model, config),)
 
@@ -1119,8 +1204,8 @@ class SpectrumMOSSImageAdaptive:
     """Validated adaptive policy for native ComfyUI MOSS-Image."""
 
     DESCRIPTION = (
-        "Experimental error-aware Spectrum scheduler for MOSS-Image. It measures forecast error "
-        "at actual refreshes and automatically adjusts the forecast horizon. Speed varies with prompt and trajectory."
+        "Error-aware Spectrum scheduler for MOSS-Image. It measures forecast error at actual refreshes "
+        "and adjusts scheduling automatically. Native ER-SDE is detected automatically and uses the solver bridge."
     )
     CATEGORY = "model/optimization"
     RETURN_TYPES = ("MODEL",)
@@ -1134,27 +1219,27 @@ class SpectrumMOSSImageAdaptive:
                 "model": ("MODEL",),
                 "warmup_steps": ("INT", {
                     "default": 8, "min": 0, "max": 64, "step": 1,
-                    "tooltip": "Initial steps that always run the full transformer. Higher = safer quality, lower = more potential speed. Default 8.",
+                    "tooltip": "Initial steps that always run the full transformer before forecasting is allowed. Higher = safer, lower = faster.",
                 }),
                 "detail_guard_steps": ("INT", {
                     "default": 8, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "Protected steps immediately after warmup. At most one forecast is allowed between actual refreshes. Higher = safer early details but slower. Default 8.",
+                    "tooltip": "Protected steps after warmup before the adaptive controller can act aggressively. Higher = safer early details, lower = faster.",
                 }),
                 "tail_actual_steps": ("INT", {
                     "default": 2, "min": 0, "max": 16, "step": 1,
-                    "tooltip": "Final steps that always run the full transformer. Helps preserve late-stage details. Higher = safer, lower = faster. Default 2.",
+                    "tooltip": "Final steps forced to use the full transformer. Higher = safer, lower = faster.",
                 }),
                 "post_guard_horizon_cap": ("INT", {
                     "default": 6, "min": 1, "max": 16, "step": 1,
-                    "tooltip": "Maximum forecast streak allowed after the detail guard. The adaptive error controller may automatically use a lower value. Higher = more potential speed but greater quality risk.",
+                    "tooltip": "Maximum forecast streak after the detail guard. Higher = faster/riskier, lower = safer. ER-SDE: capped at 1.",
                 }),
                 "window_size": ("FLOAT", {
                     "default": 2.0, "min": 1.0, "max": 16.0, "step": 0.25,
-                    "tooltip": "Starting forecast budget before the next full transformer refresh. The adaptive safety controller can reduce it when forecast error increases.",
+                    "tooltip": "Starting forecast budget before the next actual refresh. Higher = more aggressive. ER-SDE: ignored.",
                 }),
                 "flex_window": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 8.0, "step": 0.05,
-                    "tooltip": "How quickly the forecast budget can grow after successful refreshes. Higher = more aggressive speed ramp. Lower = more conservative.",
+                    "tooltip": "How quickly the forecast budget grows after successful refreshes. Higher = more aggressive. ER-SDE: ignored.",
                 }),
                 "cache_device": (["main_device", "offload_device", "cpu"], {
                     "default": "main_device",
@@ -1169,13 +1254,18 @@ class SpectrumMOSSImageAdaptive:
                 # middle would shift values when an old v0.6 workflow is loaded.
                 "error_tolerance": ("FLOAT", {
                     "default": 1.0, "min": 0.75, "max": 1.5, "step": 0.05,
-                    "tooltip": "Controls how much forecast error the adaptive scheduler tolerates before reducing the forecast horizon. Higher = faster but riskier. Lower = safer but slower. 1.0 uses the default.",
+                    "tooltip": "Controls how much forecast error Adaptive tolerates before becoming more conservative. Higher = faster/riskier, lower = safer.",
+                }),
+                "warn_unverified_sampler": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Show a console warning for samplers not yet validated. Does not change sampler behavior.",
                 }),
             }
         }
 
     def patch(self, model, warmup_steps, detail_guard_steps, tail_actual_steps,
-              post_guard_horizon_cap, window_size, flex_window, cache_device, debug, error_tolerance):
+              post_guard_horizon_cap, window_size, flex_window, cache_device, debug, error_tolerance,
+              warn_unverified_sampler):
         cap = max(1, int(post_guard_horizon_cap))
         config = SpectrumConfig(
             mode="adaptive",
@@ -1193,6 +1283,7 @@ class SpectrumMOSSImageAdaptive:
             post_guard_horizon_cap=cap,
             error_tolerance=error_tolerance,
             debug=debug,
+            warn_unverified_sampler=warn_unverified_sampler,
         )
         return (apply_spectrum_moss(model, config),)
 

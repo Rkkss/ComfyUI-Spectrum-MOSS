@@ -1,4 +1,4 @@
 {
-  "Spectrum MOSS-Image (Manual)": "Manual Spectrum hidden-state forecasting scheduler for native MOSS-Image.",
-  "Spectrum MOSS-Image (Adaptive)": "Experimental error-aware Spectrum scheduler for native MOSS-Image with adaptive forecast horizon."
+  "Spectrum MOSS-Image (Manual)": "Manual Spectrum scheduler for native MOSS-Image with automatic ER-SDE solver bridging.",
+  "Spectrum MOSS-Image (Adaptive)": "Error-aware Spectrum scheduler for native MOSS-Image with automatic ER-SDE solver bridging."
 }
