@@ -1,12 +1,12 @@
 # ComfyUI-Spectrum-MOSS
 
-Spectrum-style hidden-state forecasting ComfyUI node for **MOSS-Image**.
+Spectrum-style hidden-state forecasting ComfyUI node for **MOSS-Image**.  
 vibe-coded
 
 This build contains two nodes:
 
 - **Spectrum MOSS-Image (Manual)** - Manually choose forecast steps after warmup
-- **Spectrum MOSS-Image (Adaptive)** - Experimental node. It will try to adapt the forecast steps with forecast error estimation to maintain quality. Speed can be vary
+- **Spectrum MOSS-Image (Adaptive)** - Experimental node. It will try to adapt the forecast steps with forecast error estimation to maintain quality. Speed may vary.
 
 Default (adaptive) scheduling behavior:
 
@@ -16,44 +16,41 @@ Default (adaptive) scheduling behavior:
 4. The final (tail) steps are actual evaluations.
 
 ## Recommended settings
- 
- OpenMOSS Official's suggestion 50 steps/euler+sgm_uniform:
- 
- <img src="examples/euler.jpg" width="48%">
 
- 
- Comfy-Org's template 25 steps/er_sde+simple: 
- 
- <img src="examples/er_sde.jpg" width="48%">
+OpenMOSS official suggestion: 50 steps / Euler + sgm_uniform
 
+<img src="examples/euler.jpg" width="48%">
 
+Comfy-Org template: 25 steps / er_sde + simple
 
-- er_sdm is supported through a solver bridge, but er_sde is a non-deterministic sampler; results may vary. Max_consecutive_forecasts = 1 is the recommended setting for this sampler. Adaptive node will force max forecast =1 when er_sde is detected.
-- If you use SkiplayerGuidance, set start & end to 0.000-1.000. 0.000-0.500 will force spectrum relearn mid sigma, thus reducing forecast potential 
+<img src="examples/er_sde.jpg" width="48%">
+
+- er_sde is supported through a solver bridge. Max_consecutive_forecasts = 1 is the recommended setting for this sampler. Adaptive will force max forecast = 1 when er_sde is detected.
+- If you use SkipLayerGuidance, set start & end to 0.000-1.000. Partial ranges like 0.000-0.500 will make Spectrum relearn at the transition, so there may be fewer forecast steps.
 - Other schedulers should run. Other samplers may not run well.
 
-Speed gain is about x2 - x2.5 with the default setup
+Speed gain is about 2x - 2.5x with the default setup.
 
-Default settings are on the safer side. If you want more speed, increase max_consecutive_forecasts, and/or reduce warmup_steps/tail_actual_steps. 
+Default settings are on the safer side. If you want more speed, increase max_consecutive_forecasts and/or reduce warmup_steps/tail_actual_steps.
 
-Detail_guard allows at most 1 forecast during this window. A higher error_tolerance value allows more "room for error" after guard steps.  Both values may also affect speed.
+Detail_guard allows at most 1 forecast during this window. Higher error_tolerance allows more room for error after guard steps. Both values may affect speed.
 
-## Examples 
+## Examples
+
 <p align="center">
   <img src="examples/1.png" width="48%">
   <img src="examples/2.png" width="48%">
-   <img src="examples/3.png" width="48%">
-    <img src="examples/4.png" width="48%">
-
+  <img src="examples/3.png" width="48%">
+  <img src="examples/4.png" width="48%">
 </p>
 
 ## Credits
+
 Spectrum method / paper:
 
 - **Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration** — arXiv:2603.01623
 - Official implementation: https://github.com/hanjq17/Spectrum
-- - https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3 (solver-space ER-SDE bridge approach)
-
+- https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3 (solver-space ER-SDE bridge approach)
 
 ## License
 
