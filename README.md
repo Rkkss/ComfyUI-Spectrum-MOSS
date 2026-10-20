@@ -16,7 +16,13 @@ Default (adaptive) scheduling behavior:
 4. The final (tail) steps are actual evaluations.
 
 ## Recommended settings
+ 
  OpenMOSS Official's suggestion 50 steps/euler+sgm_uniform 
+ <img src="examples/euler.png" width="48%">
+
+ Comfy-Org's template 25 steps/er_sde+simple 
+ <img src="examples/er_sde.png" width="48%">
+
 
 
 - er_sdm is supported through a solver bridge, but er_sde is a non-deterministic sampler; results may vary. Max_consecutive_forecasts = 1 is the recommended setting for this sampler. Adaptive node will force max forecast =1 when er_sde is detected.
