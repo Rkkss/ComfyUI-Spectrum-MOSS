@@ -60,7 +60,7 @@ def _log_debug(enabled: bool, msg: str) -> None:
 
 
 def _log_warning(msg: str) -> None:
-    print(f"[{LOG_TAG}] WARNING: {msg}", flush=True)
+    print(f"\033[93m[{LOG_TAG}] WARNING: {msg}\033[0m", flush=True)
 
 
 @dataclass(frozen=True)
@@ -74,7 +74,7 @@ class SpectrumConfig:
 
     mode: str = "manual"
     warmup_steps: int = 8
-    tail_actual_steps: int = 2
+    tail_actual_steps: int = 1
     window_size: float = 2.0
     flex_window: float = 0.75
     max_consecutive_forecasts: int = 2  # Manual mode only.
@@ -92,6 +92,12 @@ class SpectrumConfig:
 
     debug: bool = False
     warn_unverified_sampler: bool = True
+
+    # Internal sampler-specific runtime policy; not exposed as node controls.
+    # ER-SDE uses synchronized branch lifecycle/decisions in both modes. Adaptive
+    # additionally enables the validated H1->H2 controller.
+    er_sde_sync: bool = False
+    er_sde_h2: bool = False
 
     @property
     def adaptive(self) -> bool:
@@ -377,6 +383,14 @@ class HistoryWeightChebyshevForecaster:
         return out
 
 
+def _initial_adaptive_horizon(config: SpectrumConfig) -> int:
+    # Native ER-SDE starts conservatively at H1 and must earn H2 through the
+    # existing error controller. Other samplers keep the legacy Adaptive policy.
+    if config.er_sde_h2:
+        return 1
+    return max(1, config.post_guard_horizon_cap)
+
+
 @dataclass
 class SpectrumBranchState:
     config: SpectrumConfig
@@ -398,6 +412,9 @@ class SpectrumBranchState:
     last_local_ratio: Optional[float] = None
     last_validation_tier: str = "learning"
     last_streak: int = 0
+    horizon_upgrades: int = 0
+    horizon_downgrades: int = 0
+    repair_events: int = 0
 
     # Temporary guard after a local anomaly, counted in validation refreshes.
     cooldown_refreshes_remaining: int = 0
@@ -406,7 +423,7 @@ class SpectrumBranchState:
     def __post_init__(self) -> None:
         self.current_window = float(self.config.window_size)
         self.adaptive_horizon = (
-            max(1, self.config.post_guard_horizon_cap)
+            _initial_adaptive_horizon(self.config)
             if self.config.adaptive
             else max(1, self.config.max_consecutive_forecasts)
         )
@@ -427,7 +444,7 @@ class SpectrumBranchState:
         self.baseline_p99 = None
         self.baseline_observations = 0
         self.adaptive_horizon = (
-            max(1, self.config.post_guard_horizon_cap)
+            _initial_adaptive_horizon(self.config)
             if self.config.adaptive
             else max(1, self.config.max_consecutive_forecasts)
         )
@@ -438,6 +455,9 @@ class SpectrumBranchState:
         self.last_local_ratio = None
         self.last_validation_tier = "learning"
         self.last_streak = 0
+        self.horizon_upgrades = 0
+        self.horizon_downgrades = 0
+        self.repair_events = 0
         self.cooldown_refreshes_remaining = 0
         self.cooldown_horizon_cap = None
 
@@ -452,6 +472,17 @@ class SpectrumRootState:
     completed_branches: set[Any] = field(default_factory=set)
     summary_logged: bool = False
 
+    # Active patch signature for each CFG/SLG cond branch while Adaptive ER-SDE
+    # synchronization is in use. Partial SLG windows can replace a branch key
+    # mid-run. Historical branches stay in ``branches`` for statistics only.
+    active_branch_keys: dict[Any, Any] = field(default_factory=dict)
+
+    # One global Adaptive ER-SDE A/F decision is cached per solver step so
+    # CFG/SLG branches cannot choose different modes.
+    global_decision_step: Optional[int] = None
+    global_decision_actual: Optional[bool] = None
+    global_decision_reason: Optional[str] = None
+
     def reset_run(self) -> None:
         self.branches.clear()
         self.last_sigmas_id = None
@@ -459,11 +490,47 @@ class SpectrumRootState:
         self.last_step_index = None
         self.completed_branches.clear()
         self.summary_logged = False
+        self.active_branch_keys.clear()
+        self.global_decision_step = None
+        self.global_decision_actual = None
+        self.global_decision_reason = None
 
     def branch(self, key: Any) -> SpectrumBranchState:
         if key not in self.branches:
             self.branches[key] = SpectrumBranchState(_runtime_config(self.config))
         return self.branches[key]
+
+    def activate_er_sde_branch(self, cond_key: Any, branch_key: Any, debug: bool = False) -> None:
+        """Make ``branch_key`` the sole active ER-SDE branch for ``cond_key``.
+
+        SkipLayerGuidanceDiTSimple changes its DiT patch signature when a partial
+        guidance window starts/ends. That intentionally creates a fresh history;
+        the superseded state must be retired from the global scheduler.
+        """
+        previous = self.active_branch_keys.get(cond_key)
+        if previous == branch_key:
+            return
+        if previous is not None:
+            old_branch = self.branches.get(previous)
+            if old_branch is not None:
+                old_branch.forecaster.release_features()
+            _log_debug(
+                debug,
+                f"ER-SDE branch transition cond={cond_key}: "
+                f"retire={previous} activate={branch_key}",
+            )
+        self.active_branch_keys[cond_key] = branch_key
+
+    def active_branch_items(self) -> list[tuple[Any, SpectrumBranchState]]:
+        items: list[tuple[Any, SpectrumBranchState]] = []
+        for key in self.active_branch_keys.values():
+            branch = self.branches.get(key)
+            if branch is not None:
+                items.append((key, branch))
+        return items
+
+    def active_branch_key_set(self) -> set[Any]:
+        return {key for key in self.active_branch_keys.values() if key in self.branches}
 
 
 def _resolve_cache_target(hidden: torch.Tensor, cache_device: str) -> tuple[torch.device, torch.dtype]:
@@ -539,33 +606,26 @@ def _patch_signature(transformer_options: dict) -> tuple[str, ...]:
 
 
 def _runtime_config(config: SpectrumConfig) -> SpectrumConfig:
-    """Apply only sampler-specific runtime policy overrides.
-
-    ER-SDE uses the predictor settings validated by the bridge tests. Manual
-    scheduling controls remain user-controlled. Adaptive keeps its error/guard
-    logic, but ER-SDE caps the forecast horizon at one and therefore ignores
-    its window-growth controls.
-    """
+    """Apply sampler-specific runtime policy without changing the public node UI."""
     if not er_sde_active():
         return config
     if config.adaptive:
         return replace(
             config,
-            window_size=1.0,
+            window_size=2.0,
             flex_window=0.0,
-            post_guard_horizon_cap=1,
+            post_guard_horizon_cap=2,
             history_points=_ADAPTIVE_HISTORY_POINTS,
             chebyshev_degree=_ADAPTIVE_CHEBYSHEV_DEGREE,
             ridge_lambda=_ADAPTIVE_RIDGE_LAMBDA,
             blend_weight=_ADAPTIVE_BLEND_WEIGHT,
+            er_sde_sync=True,
+            er_sde_h2=True,
         )
-    return replace(
-        config,
-        history_points=_ADAPTIVE_HISTORY_POINTS,
-        chebyshev_degree=_ADAPTIVE_CHEBYSHEV_DEGREE,
-        ridge_lambda=_ADAPTIVE_RIDGE_LAMBDA,
-        blend_weight=_ADAPTIVE_BLEND_WEIGHT,
-    )
+
+    # Manual stays manual under ER-SDE: keep every user-selected predictor and
+    # cadence control. Only add solver-safe branch synchronization/lifecycle.
+    return replace(config, er_sde_sync=True, er_sde_h2=False)
 
 
 def _adaptive_phase_horizon_cap(config: SpectrumConfig, step_index: int) -> int:
@@ -620,6 +680,99 @@ def _choose_actual(
 
     interval = max(1, int(math.floor(state.current_window)))
     if (state.consecutive_forecasts + 1) % interval == 0:
+        return True, "window"
+    return False, "forecast"
+
+
+def _choose_actual_global_er_sde_adaptive(
+    root: SpectrumRootState,
+    step_index: int,
+    total_steps: int,
+    control_present: bool,
+    config: SpectrumConfig,
+) -> tuple[bool, str]:
+    """Choose one conservative A/F mode for every Adaptive ER-SDE branch.
+
+    Per-branch error estimation remains independent, but the least-permissive
+    active CFG/SLG branch owns the shared solver-step decision.
+    """
+    if step_index < 0:
+        return True, "unknown_step"
+    if step_index < config.warmup_steps:
+        return True, "warmup"
+    if config.tail_actual_steps > 0 and step_index >= max(0, total_steps - config.tail_actual_steps):
+        return True, "tail"
+    if control_present and config.force_actual_on_control:
+        return True, "control"
+
+    # Only currently active branch signatures participate. A partial SLG window
+    # can leave historical branch states in root.branches; including those here
+    # makes stale error/readiness state permanently throttle the shared cadence.
+    branches = [b for _, b in root.active_branch_items()]
+    if not branches or any(not b.forecaster.ready() for b in branches):
+        return True, "insufficient_history"
+    if any(b.repair_actual_steps_remaining > 0 for b in branches):
+        return True, "local_repair"
+
+    phase_cap = _adaptive_phase_horizon_cap(config, step_index)
+    effective_caps: list[int] = []
+    window_caps: list[int] = []
+    safety_caps: list[int] = []
+    for b in branches:
+        window_cap = max(1, int(math.floor(b.current_window)))
+        safety_cap = min(max(1, b.adaptive_horizon), phase_cap)
+        if b.cooldown_refreshes_remaining > 0 and b.cooldown_horizon_cap is not None:
+            safety_cap = min(safety_cap, max(1, b.cooldown_horizon_cap))
+        window_caps.append(window_cap)
+        safety_caps.append(safety_cap)
+        effective_caps.append(min(window_cap, safety_cap))
+
+    # Conservative shared cap: the least permissive branch owns the step.
+    effective_cap = min(effective_caps)
+    max_streak = max(b.consecutive_forecasts for b in branches)
+    if max_streak >= effective_cap:
+        window_cap = min(window_caps)
+        safety_cap = min(safety_caps)
+        return True, "window" if window_cap <= safety_cap else "local_guard"
+    return False, "forecast"
+
+
+def _choose_actual_global_er_sde_manual(
+    root: SpectrumRootState,
+    step_index: int,
+    total_steps: int,
+    control_present: bool,
+    config: SpectrumConfig,
+) -> tuple[bool, str]:
+    """Choose one ER-SDE A/F mode while preserving Manual cadence controls.
+
+    Manual does not use the Adaptive error controller. The user-selected warmup,
+    tail, window/flex growth and max-consecutive-forecast limits remain authoritative;
+    the least-ready active CFG/SLG branch only synchronizes the shared solver step.
+    """
+    if step_index < 0:
+        return True, "unknown_step"
+    if step_index < config.warmup_steps:
+        return True, "warmup"
+    if config.tail_actual_steps > 0 and step_index >= max(0, total_steps - config.tail_actual_steps):
+        return True, "tail"
+    if control_present and config.force_actual_on_control:
+        return True, "control"
+
+    branches = [b for _, b in root.active_branch_items()]
+    if not branches or any(not b.forecaster.ready() for b in branches):
+        return True, "insufficient_history"
+
+    if config.max_consecutive_forecasts <= 0:
+        return True, "horizon_refresh"
+    if any(b.consecutive_forecasts >= config.max_consecutive_forecasts for b in branches):
+        return True, "horizon_refresh"
+
+    # Preserve the original Manual expanding-window scheduler. If active branch
+    # histories differ around a partial SLG transition, the most conservative
+    # branch wins the shared ER-SDE decision.
+    intervals = [max(1, int(math.floor(b.current_window))) for b in branches]
+    if any((b.consecutive_forecasts + 1) % interval == 0 for b, interval in zip(branches, intervals)):
         return True, "window"
     return False, "forecast"
 
@@ -722,6 +875,8 @@ def _adaptive_validate_and_update(
 
     branch.last_local_ratio = ratio
     branch.last_validation_tier = tier
+    horizon_before = branch.adaptive_horizon
+    repair_before = branch.repair_actual_steps_remaining
 
     if allow_action and branch.baseline_observations >= 3:
         if tier == "high":
@@ -735,6 +890,8 @@ def _adaptive_validate_and_update(
             branch.repair_actual_steps_remaining = max(
                 branch.repair_actual_steps_remaining, _ADAPTIVE_REPAIR_ACTUAL_STEPS
             )
+            if repair_before <= 0 and branch.repair_actual_steps_remaining > 0:
+                branch.repair_events += 1
             branch.cooldown_refreshes_remaining = max(
                 branch.cooldown_refreshes_remaining, _ADAPTIVE_HIGH_COOLDOWN_REFRESHES
             )
@@ -758,6 +915,21 @@ def _adaptive_validate_and_update(
                     branch.adaptive_horizon = min(max_h, branch.adaptive_horizon + 1)
                     branch.safe_refreshes = 0
 
+    if branch.adaptive_horizon > horizon_before:
+        branch.horizon_upgrades += 1
+        _log_debug(
+            config.debug,
+            f"adaptive horizon upgrade {horizon_before}->{branch.adaptive_horizon} "
+            f"tier={tier} ratio={ratio:.3f}",
+        )
+    elif branch.adaptive_horizon < horizon_before:
+        branch.horizon_downgrades += 1
+        _log_debug(
+            config.debug,
+            f"adaptive horizon downgrade {horizon_before}->{branch.adaptive_horizon} "
+            f"tier={tier} ratio={ratio:.3f}",
+        )
+
     _log_debug(
         config.debug,
         f"local tier={tier} p95={p95:.5f} p99={p99:.5f} "
@@ -768,6 +940,18 @@ def _adaptive_validate_and_update(
         f"cooldown={branch.cooldown_refreshes_remaining} "
         f"coolcap={branch.cooldown_horizon_cap if branch.cooldown_horizon_cap is not None else 'none'}",
     )
+
+def _adaptive_phase_name(config: SpectrumConfig, step_index: int, total_steps: int) -> str:
+    if step_index < config.warmup_steps:
+        return "warmup"
+    tail_start = max(0, total_steps - config.tail_actual_steps) if config.tail_actual_steps > 0 else total_steps
+    if step_index >= tail_start:
+        return "tail"
+    guard_end = config.warmup_steps + max(0, config.detail_guard_steps)
+    if step_index < guard_end:
+        return "guard"
+    return "post_guard"
+
 
 def _run_actual(
     executor: Any,
@@ -825,6 +1009,7 @@ def _run_actual(
     _log_debug(
         config.debug,
         f"step {step_index + 1}/{total_steps} branch={branch_key} "
+        f"phase={_adaptive_phase_name(config, step_index, total_steps) if config.adaptive else 'manual'} "
         f"mode=actual reason={reason} history={branch.forecaster.history_size} "
         f"p95={branch.last_p95 if branch.last_p95 is not None else 'n/a'} "
         f"p99={branch.last_p99 if branch.last_p99 is not None else 'n/a'} "
@@ -875,6 +1060,7 @@ def _run_forecast(
     _log_debug(
         config.debug,
         f"step {step_index + 1}/{total_steps} branch={branch_key} "
+        f"phase={_adaptive_phase_name(config, step_index, total_steps) if config.adaptive else 'manual'} "
         f"mode=forecast history={branch.forecaster.history_size} "
         f"ratio={branch.last_local_ratio if branch.last_local_ratio is not None else 'n/a'} "
         f"tier={branch.last_validation_tier} horizon={branch.adaptive_horizon} "
@@ -925,6 +1111,8 @@ def _make_spectrum_wrapper(config: SpectrumConfig, decision_observer=None):
         branch_key = (cond_key, patch_key)
         branch = root.branch(branch_key)
         runtime_config = branch.config
+        if runtime_config.er_sde_sync:
+            root.activate_er_sde_branch(cond_key, branch_key, runtime_config.debug)
 
         image_tokens = int(x.shape[-2]) * int(x.shape[-1])
         known_shape = branch.forecaster.feature_shape
@@ -939,13 +1127,55 @@ def _make_spectrum_wrapper(config: SpectrumConfig, decision_observer=None):
             kwargs.get("control") is not None
             or transformer_options.get("control") is not None
         )
-        actual, reason = _choose_actual(
-            branch,
-            step_index,
-            total_steps,
-            control_present,
-            runtime_config,
-        )
+        if runtime_config.er_sde_sync:
+            if root.global_decision_step != step_index:
+                if runtime_config.er_sde_h2:
+                    actual, reason = _choose_actual_global_er_sde_adaptive(
+                        root, step_index, total_steps, control_present, runtime_config
+                    )
+                else:
+                    actual, reason = _choose_actual_global_er_sde_manual(
+                        root, step_index, total_steps, control_present, runtime_config
+                    )
+                root.global_decision_step = step_index
+                root.global_decision_actual = bool(actual)
+                root.global_decision_reason = reason
+                if runtime_config.debug:
+                    active_items = root.active_branch_items()
+                    if runtime_config.er_sde_h2:
+                        ratios = [
+                            b.last_local_ratio for _, b in active_items
+                            if b.last_local_ratio is not None
+                        ]
+                        horizons = [b.adaptive_horizon for _, b in active_items]
+                        _log_debug(
+                            True,
+                            f"ER-SDE adaptive global decision step {step_index + 1}: "
+                            f"mode={'actual' if actual else 'forecast'} reason={reason} "
+                            f"worst_ratio={max(ratios) if ratios else 'n/a'} "
+                            f"branch_horizons={horizons}",
+                        )
+                    else:
+                        windows = [round(b.current_window, 3) for _, b in active_items]
+                        streaks = [b.consecutive_forecasts for _, b in active_items]
+                        _log_debug(
+                            True,
+                            f"ER-SDE manual global decision step {step_index + 1}: "
+                            f"mode={'actual' if actual else 'forecast'} reason={reason} "
+                            f"current_windows={windows} streaks={streaks} "
+                            f"max_consecutive={runtime_config.max_consecutive_forecasts}",
+                        )
+            else:
+                actual = bool(root.global_decision_actual)
+                reason = root.global_decision_reason or ("actual" if actual else "forecast")
+        else:
+            actual, reason = _choose_actual(
+                branch,
+                step_index,
+                total_steps,
+                control_present,
+                runtime_config,
+            )
         coord = _normalize_step_position(step_index, total_steps)
 
         try:
@@ -1007,19 +1237,37 @@ def _make_spectrum_wrapper(config: SpectrumConfig, decision_observer=None):
             root.last_sigmas_id = id(sigmas)
             root.last_total_steps = total_steps
 
-        # Release anchors after all branches that exist at the final step have completed.
+        # Release anchors after all branches active at the final step complete.
+        # Partial SLG windows may leave retired historical states for statistics.
         if step_index >= 0 and step_index >= total_steps - 1:
             root.completed_branches.add(branch_key)
-            if len(root.completed_branches) >= len(root.branches):
+            if runtime_config.er_sde_sync:
+                required_final_branches = root.active_branch_key_set()
+                final_complete = bool(required_final_branches) and required_final_branches.issubset(root.completed_branches)
+                active_branch_count = len(required_final_branches)
+            else:
+                final_complete = len(root.completed_branches) >= len(root.branches)
+                active_branch_count = len(root.branches)
+
+            if final_complete:
                 if runtime_config.debug and not root.summary_logged:
                     actual_calls = sum(b.actual_count for b in root.branches.values())
                     forecast_calls = sum(b.forecast_count for b in root.branches.values())
                     total_calls = actual_calls + forecast_calls
                     ratio = (float(total_calls) / float(actual_calls)) if actual_calls else 0.0
+                    upgrades = sum(b.horizon_upgrades for b in root.branches.values())
+                    downgrades = sum(b.horizon_downgrades for b in root.branches.values())
+                    repairs = sum(b.repair_events for b in root.branches.values())
+                    historical_suffix = (
+                        f" historical_branches={len(root.branches)}"
+                        if runtime_config.er_sde_sync and len(root.branches) != active_branch_count
+                        else ""
+                    )
                     _log_debug(
                         True,
-                        f"run complete: branches={len(root.branches)} actual={actual_calls} "
-                        f"forecast={forecast_calls} calls={total_calls} theoretical_transformer_speedup={ratio:.2f}x",
+                        f"run complete: branches={active_branch_count}{historical_suffix} actual={actual_calls} "
+                        f"forecast={forecast_calls} calls={total_calls} theoretical_transformer_speedup={ratio:.2f}x "
+                        f"horizon_up={upgrades} horizon_down={downgrades} repair_events={repairs}",
                     )
                     root.summary_logged = True
                 for b in root.branches.values():
@@ -1128,7 +1376,7 @@ class SpectrumMOSSImageManual:
                     "tooltip": "Initial steps that always run the full transformer before forecasting is allowed. Higher = safer, lower = faster.",
                 }),
                 "tail_actual_steps": ("INT", {
-                    "default": 2, "min": 0, "max": 64, "step": 1,
+                    "default": 1, "min": 0, "max": 64, "step": 1,
                     "tooltip": "Final steps forced to use the full transformer. Higher = safer, lower = faster.",
                 }),
                 "window_size": ("FLOAT", {
@@ -1141,23 +1389,23 @@ class SpectrumMOSSImageManual:
                 }),
                 "max_consecutive_forecasts": ("INT", {
                     "default": 2, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "Maximum forecast steps allowed in a row before an actual refresh. Higher = faster/riskier, lower = safer.",
+                    "tooltip": "Hard ceiling on consecutive forecast steps. The actual streak still grows according to window_size + flex_window; this only limits how far that paper-style schedule may go. With ER-SDE, F1/F2 use the validated bridge and longer streaks use a conservative latest-actual hold.",
                 }),
                 "history_points": ("INT", {
                     "default": 8, "min": 2, "max": 32, "step": 1,
-                    "tooltip": "Number of actual hidden-state anchors kept for the Spectrum predictor. More history uses more memory. ER-SDE: ignored.",
+                    "tooltip": "Number of actual hidden-state anchors kept for the Spectrum predictor. More history uses more memory.",
                 }),
                 "chebyshev_degree": ("INT", {
                     "default": 4, "min": 1, "max": 12, "step": 1,
-                    "tooltip": "Polynomial degree used by the Spectrum predictor. Higher can model more complex trends but may be less stable. ER-SDE: ignored.",
+                    "tooltip": "Polynomial degree used by the Spectrum predictor. Higher can model more complex trends but may be less stable.",
                 }),
                 "ridge_lambda": ("FLOAT", {
                     "default": 0.1, "min": 0.0, "max": 10.0, "step": 0.01,
-                    "tooltip": "Regularization strength for the Spectrum predictor. Higher damps extrapolation more strongly. ER-SDE: ignored.",
+                    "tooltip": "Regularization strength for the Spectrum predictor. Higher damps extrapolation more strongly.",
                 }),
                 "blend_weight": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Mix between spectral prediction and linear extrapolation. 0 = linear only, 1 = spectral only. ER-SDE: ignored.",
+                    "tooltip": "Mix between spectral prediction and linear extrapolation. 0 = linear only, 1 = spectral only.",
                 }),
                 "cache_device": (["main_device", "offload_device", "cpu"], {
                     "default": "main_device",
@@ -1226,35 +1474,32 @@ class SpectrumMOSSImageAdaptive:
                     "tooltip": "Protected steps after warmup before the adaptive controller can act aggressively. Higher = safer early details, lower = faster.",
                 }),
                 "tail_actual_steps": ("INT", {
-                    "default": 2, "min": 0, "max": 16, "step": 1,
+                    "default": 1, "min": 0, "max": 16, "step": 1,
                     "tooltip": "Final steps forced to use the full transformer. Higher = safer, lower = faster.",
                 }),
                 "post_guard_horizon_cap": ("INT", {
                     "default": 6, "min": 1, "max": 16, "step": 1,
-                    "tooltip": "Maximum forecast streak after the detail guard. Higher = faster/riskier, lower = safer. ER-SDE: capped at 1.",
+                    "tooltip": "Maximum forecast streak after the detail guard for non-ER-SDE samplers. Adaptive ER-SDE ignores this control and manages an internal H1-to-H2 horizon instead.",
                 }),
                 "window_size": ("FLOAT", {
                     "default": 2.0, "min": 1.0, "max": 16.0, "step": 0.25,
-                    "tooltip": "Starting forecast budget before the next actual refresh. Higher = more aggressive. ER-SDE: ignored.",
+                    "tooltip": "Starting forecast budget before the next actual refresh for non-ER-SDE samplers. Adaptive ER-SDE ignores this control and uses its synchronized H1-to-H2 cadence.",
                 }),
                 "flex_window": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 8.0, "step": 0.05,
-                    "tooltip": "How quickly the forecast budget grows after successful refreshes. Higher = more aggressive. ER-SDE: ignored.",
+                    "tooltip": "How quickly the forecast budget grows after successful refreshes for non-ER-SDE samplers. Adaptive ER-SDE ignores this control and uses its synchronized H1-to-H2 cadence.",
                 }),
                 "cache_device": (["main_device", "offload_device", "cpu"], {
                     "default": "main_device",
                     "tooltip": "Where actual hidden-state history is stored. main_device is fastest but uses VRAM. CPU/offload saves VRAM but may reduce speed.",
                 }),
+                "error_tolerance": ("FLOAT", {
+                    "default": 1.0, "min": 0.75, "max": 1.5, "step": 0.05,
+                    "tooltip": "Controls how much forecast error Adaptive tolerates before becoming more conservative. Higher = faster/riskier, lower = safer. This remains active with ER-SDE.",
+                }),
                 "debug": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Print adaptive decisions, p95/p99 forecast error, horizon changes and final actual/forecast counts to the console.",
-                }),
-                # Keep new widgets appended after all v0.6 widgets. ComfyUI stores
-                # workflow widget values positionally, so inserting this in the
-                # middle would shift values when an old v0.6 workflow is loaded.
-                "error_tolerance": ("FLOAT", {
-                    "default": 1.0, "min": 0.75, "max": 1.5, "step": 0.05,
-                    "tooltip": "Controls how much forecast error Adaptive tolerates before becoming more conservative. Higher = faster/riskier, lower = safer.",
                 }),
                 "warn_unverified_sampler": ("BOOLEAN", {
                     "default": True,
@@ -1264,7 +1509,7 @@ class SpectrumMOSSImageAdaptive:
         }
 
     def patch(self, model, warmup_steps, detail_guard_steps, tail_actual_steps,
-              post_guard_horizon_cap, window_size, flex_window, cache_device, debug, error_tolerance,
+              post_guard_horizon_cap, window_size, flex_window, cache_device, error_tolerance, debug,
               warn_unverified_sampler):
         cap = max(1, int(post_guard_horizon_cap))
         config = SpectrumConfig(
