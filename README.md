@@ -25,7 +25,7 @@ Comfy-Org template: 25 steps / er_sde + simple
 
 <img src="examples/er_sde.jpg" width="48%">
 
-- er_sde is supported through a solver bridge. Max_consecutive_forecasts = 1 is the recommended setting for this sampler. Adaptive will force max forecast = 1 when er_sde is detected.
+- er_sde is supported through a solver bridge. Max_consecutive_forecasts = 1 is the recommended setting for this sampler. Adaptive node will force post_guard_horizon_forecast =< 2 when er_sde is detected.
 - If you use SkipLayerGuidance, set start & end to 0.000-1.000. Partial ranges like 0.000-0.500 will make Spectrum relearn at the transition, so there may be fewer forecast steps.
 - Other schedulers should run. Other samplers may not run well.
 
