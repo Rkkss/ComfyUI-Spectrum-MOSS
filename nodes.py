@@ -614,7 +614,7 @@ def _runtime_config(config: SpectrumConfig) -> SpectrumConfig:
             config,
             window_size=2.0,
             flex_window=0.0,
-            post_guard_horizon_cap=2,
+            post_guard_horizon_cap=min(config.post_guard_horizon_cap, 2),
             history_points=_ADAPTIVE_HISTORY_POINTS,
             chebyshev_degree=_ADAPTIVE_CHEBYSHEV_DEGREE,
             ridge_lambda=_ADAPTIVE_RIDGE_LAMBDA,
@@ -1479,7 +1479,7 @@ class SpectrumMOSSImageAdaptive:
                 }),
                 "post_guard_horizon_cap": ("INT", {
                     "default": 6, "min": 1, "max": 16, "step": 1,
-                    "tooltip": "Maximum forecast streak after the detail guard for non-ER-SDE samplers. Adaptive ER-SDE ignores this control and manages an internal H1-to-H2 horizon instead.",
+                    "tooltip": "Maximum consecutive forecasts after the detail guard. Adaptive ER-SDE respects values 1 or 2 (higher values are capped at 2); the controller may use fewer.",
                 }),
                 "window_size": ("FLOAT", {
                     "default": 2.0, "min": 1.0, "max": 16.0, "step": 0.25,
